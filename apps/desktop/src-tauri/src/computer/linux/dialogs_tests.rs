@@ -4,7 +4,7 @@
 //! a webview, never an allowing default. Deterministic, no compositor.
 
 use super::dialogs::{CONFIRM_CHOICE, GRANT_CHOICE, YOLO_CHOICE, YOLO_TEXT};
-use crate::computer::{GLOBAL_CONFIRM_REASON, GLOBAL_GRANT_TEXT, GLOBAL_TARGET};
+use crate::computer::GLOBAL_GRANT_TEXT;
 
 #[test]
 fn the_grant_copy_names_the_linux_desktop_without_per_app_exclusion() {
@@ -12,12 +12,6 @@ fn the_grant_copy_names_the_linux_desktop_without_per_app_exclusion() {
     assert!(GLOBAL_GRANT_TEXT.contains("30 minutes"), "{GLOBAL_GRANT_TEXT}");
     assert!(GLOBAL_GRANT_TEXT.contains("no reliable per-app exclusion"), "{GLOBAL_GRANT_TEXT}");
     assert!(!GLOBAL_GRANT_TEXT.contains("Mac"), "{GLOBAL_GRANT_TEXT}");
-}
-
-#[test]
-fn the_confirm_reason_names_no_reliable_exclusion() {
-    assert!(GLOBAL_CONFIRM_REASON.contains("no reliable per-app exclusion"), "{GLOBAL_CONFIRM_REASON}");
-    assert!(GLOBAL_TARGET.contains("Linux"), "{GLOBAL_TARGET}");
 }
 
 #[test]
@@ -36,4 +30,17 @@ fn every_linux_dialog_defaults_to_its_refusing_button() {
 fn the_yolo_copy_matches_the_app_layer() {
     assert!(YOLO_TEXT.contains("yolo mode"), "{YOLO_TEXT}");
     assert!(YOLO_TEXT.contains("1 hour"), "{YOLO_TEXT}");
+}
+
+#[test]
+fn the_linux_yolo_copy_names_the_stop_key_this_desktop_really_has() {
+    // Whatever copy this platform's Yolo dialog asks with must name the Stop
+    // binding the user actually has: the compositor-owned key the managed Niri
+    // snippet writes. The Mac notation has no meaning here and must not leak in.
+    assert!(!YOLO_TEXT.contains('⌥'), "the Mac notation reached the Linux dialog: {YOLO_TEXT}");
+    assert!(
+        YOLO_TEXT.contains(crate::niri::kdl_binds::STOP_KEY),
+        "the Linux Stop key {:?} must be named: {YOLO_TEXT}",
+        crate::niri::kdl_binds::STOP_KEY
+    );
 }

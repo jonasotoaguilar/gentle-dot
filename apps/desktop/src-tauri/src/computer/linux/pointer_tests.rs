@@ -21,11 +21,14 @@ use super::capabilities::{AdvertisedGlobal, CapabilitySnapshot, VIRTUAL_POINTER,
 use super::geometry::OutputGeometry;
 use super::outputs::Monitor;
 use super::pointer::{
-    click_pointer, drag_pointer, move_pointer, scroll_pointer, PointerButton, PointerError,
+    click_pointer, deliver_drag_steps, drag_path, drag_pointer, move_pointer, scroll_pointer,
+    DragStep, OutputPoint, PointerButton, PointerError, DRAG_STEPS,
 };
 use super::transport::{connection_from_stream, CancelHandle, TransportKind};
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -644,6 +647,114 @@ fn drag_holds_moves_and_releases_in_order() {
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragEffect {
+    Check,
+    Motion { x: u32, y: u32 },
+    Flush,
+    Pause,
+}
+
+fn drag_endpoints() -> (OutputPoint, OutputPoint) {
+    (
+        OutputPoint { x: 100, y: 100, x_extent: 1920, y_extent: 1080 },
+        OutputPoint { x: 200, y: 150, x_extent: 1920, y_extent: 1080 },
+    )
+}
+
+#[test]
+fn drag_path_yields_exactly_the_interpolated_steps_ending_at_to() {
+    let (from, to) = drag_endpoints();
+    let path = drag_path(from, to);
+    assert_eq!(path.len(), DRAG_STEPS as usize, "one point per drag step");
+    assert_eq!(path.last(), Some(&to), "the path ends exactly at to");
+    assert!(
+        path.iter().all(|point| {
+            point.x >= from.x && point.x <= to.x && point.y >= from.y && point.y <= to.y
+        }),
+        "every step stays between from and to, got: {path:?}"
+    );
+}
+
+#[test]
+fn deliver_drag_steps_runs_check_motion_flush_pause_for_every_step() {
+    let (from, to) = drag_endpoints();
+    let path = drag_path(from, to);
+    let log: Rc<RefCell<Vec<DragEffect>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut step = DragStep {
+        check: || {
+            log.borrow_mut().push(DragEffect::Check);
+            Ok(())
+        },
+        motion: |point: &OutputPoint| {
+            log.borrow_mut().push(DragEffect::Motion { x: point.x, y: point.y });
+            Ok(())
+        },
+        flush: || {
+            log.borrow_mut().push(DragEffect::Flush);
+            Ok(())
+        },
+        pause: || {
+            log.borrow_mut().push(DragEffect::Pause);
+            Ok(())
+        },
+    };
+    deliver_drag_steps(&path, &mut step).expect("every injected effect succeeds");
+
+    let mut expected = Vec::new();
+    for point in &path {
+        expected.push(DragEffect::Check);
+        expected.push(DragEffect::Motion { x: point.x, y: point.y });
+        expected.push(DragEffect::Flush);
+        expected.push(DragEffect::Pause);
+    }
+    let effects = log.borrow().clone();
+    assert_eq!(effects, expected, "cadence is check, motion, flush, pause per step");
+    assert_eq!(
+        effects.iter().filter(|effect| matches!(effect, DragEffect::Motion { .. })).count(),
+        DRAG_STEPS as usize,
+        "one motion per drag step"
+    );
+    let last_motion = effects.iter().rev().find_map(|effect| match effect {
+        DragEffect::Motion { x, y } => Some((*x, *y)),
+        _ => None,
+    });
+    assert_eq!(last_motion, Some((to.x, to.y)), "the last motion is exactly to");
+}
+
+#[test]
+fn a_failing_check_aborts_the_step_before_motion_and_flush() {
+    let (from, to) = drag_endpoints();
+    let path = drag_path(from, to);
+    let log: Rc<RefCell<Vec<DragEffect>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut step = DragStep {
+        check: || {
+            log.borrow_mut().push(DragEffect::Check);
+            Err(PointerError::NonFiniteCoordinate)
+        },
+        motion: |point: &OutputPoint| {
+            log.borrow_mut().push(DragEffect::Motion { x: point.x, y: point.y });
+            Ok(())
+        },
+        flush: || {
+            log.borrow_mut().push(DragEffect::Flush);
+            Ok(())
+        },
+        pause: || {
+            log.borrow_mut().push(DragEffect::Pause);
+            Ok(())
+        },
+    };
+    let err = deliver_drag_steps(&path, &mut step).expect_err("a check error aborts delivery");
+    assert!(matches!(err, PointerError::NonFiniteCoordinate), "got: {err}");
+    let effects = log.borrow().clone();
+    assert_eq!(
+        effects,
+        vec![DragEffect::Check],
+        "no motion, flush or pause follows a failing check"
+    );
+}
+
 #[test]
 fn scroll_sends_signed_axis_ticks_with_frames() {
     let (client, peer, _thread) = spawn_peer(false);
@@ -711,6 +822,88 @@ fn oversized_and_nonfinite_scroll_reject_before_any_input() {
         assert_eq!(peer.bytes.load(Ordering::SeqCst), 0, "no request may precede validation");
         assert!(peer.take().is_empty(), "no event may precede validation");
     }
+}
+
+#[test]
+fn scroll_accepts_120_ticks_and_refuses_121_with_a_split_hint() {
+    // The raised Linux per-operation cap: 120 axis ticks are queued and sent.
+    let (client, peer, _thread) = spawn_peer(false);
+    let conn = connection_from_stream(client).expect("client wraps the pair");
+    scroll_pointer(
+        conn,
+        &snapshot_with(&[(7, 4)], 2),
+        &plain_monitor(7),
+        300.0,
+        400.0,
+        0.0,
+        120.0,
+        Instant::now() + Duration::from_secs(5),
+        &CancelHandle::new(),
+    )
+    .expect("120 axis ticks is exactly the raised per-operation cap");
+    let seen = wait_for(&peer, 5_000, &|log| contains(log, &Observed::Destroy));
+    assert_eq!(
+        seen.iter().filter(|event| matches!(event, Observed::Axis { .. })).count(),
+        120,
+        "a vertical scroll of 120 sends 120 vertical ticks, got: {seen:?}"
+    );
+    wait_eof(&peer, 2_000);
+
+    // One tick past the cap stays refused before any input, and the refusal tells the
+    // caller to split the scroll instead of guessing a smaller number.
+    let (client, peer, _thread) = spawn_peer(false);
+    let conn = connection_from_stream(client).expect("client wraps the pair");
+    let err = scroll_pointer(
+        conn,
+        &snapshot_with(&[(7, 4)], 2),
+        &plain_monitor(7),
+        300.0,
+        400.0,
+        0.0,
+        121.0,
+        Instant::now() + Duration::from_secs(5),
+        &CancelHandle::new(),
+    )
+    .expect_err("121 axis ticks must stay refused");
+    assert!(matches!(err, PointerError::InvalidScroll { .. }), "got: {err}");
+    let text = err.to_string();
+    assert!(text.contains("120"), "the refusal names the cap: {text}");
+    assert!(text.contains("split"), "the refusal tells the caller to split the scroll: {text}");
+    wait_eof(&peer, 2_000);
+    assert_eq!(peer.bytes.load(Ordering::SeqCst), 0, "no request may precede validation");
+    assert!(peer.take().is_empty(), "no event may precede validation");
+}
+
+#[test]
+fn a_cancelled_scroll_stops_before_any_tick_and_never_claims_success() {
+    // A Stop that arrives before the ticks are queued must end the scroll through the error
+    // path (its teardown still reaches the peer), not after queueing the whole burst.
+    let (client, peer, _thread) = spawn_peer(false);
+    let conn = connection_from_stream(client).expect("client wraps the pair");
+    let cancel = CancelHandle::new();
+    cancel.cancel();
+    let err = scroll_pointer(
+        conn,
+        &snapshot_with(&[(7, 4)], 2),
+        &plain_monitor(7),
+        300.0,
+        400.0,
+        0.0,
+        120.0,
+        Instant::now() + Duration::from_secs(5),
+        &cancel,
+    )
+    .expect_err("a cancelled scroll must not report success");
+    assert!(
+        matches!(&err, PointerError::Transport(error) if error.kind == TransportKind::Cancelled),
+        "got: {err}"
+    );
+    let seen = wait_for(&peer, 5_000, &|log| contains(log, &Observed::Destroy));
+    assert_eq!(
+        seen.iter().filter(|event| matches!(event, Observed::Axis { .. })).count(),
+        0,
+        "no tick may be queued before the Stop is honored, got: {seen:?}"
+    );
 }
 
 #[test]

@@ -85,13 +85,14 @@ const BTN_RIGHT: u32 = 0x111;
 const SCROLL_STEP: f64 = 15.0;
 
 /// Axis ticks refused past this per operation: each tick is two requests,
-/// so an unbounded vector could otherwise hold the deadline hostage.
-const MAX_SCROLL_TICKS: u32 = 40;
+/// so an unbounded vector could otherwise hold the deadline hostage. Named
+/// in the desktop-global tool catalog, which must move with it.
+pub(crate) const MAX_SCROLL_TICKS: u32 = 120;
 
 /// Drag interpolation steps (plus the exact endpoints): enough for the
 /// compositor to see motion while held, few enough to stay well inside the
 /// deadline with [`DRAG_STEP_MS`] pauses.
-const DRAG_STEPS: u32 = 8;
+pub(super) const DRAG_STEPS: u32 = 8;
 /// Pause between drag interpolation steps; the total deadline includes these.
 const DRAG_STEP_MS: u64 = 8;
 /// Settle pause between click repeats; the total deadline includes these.
@@ -131,7 +132,7 @@ pub enum PointerError {
     /// Click count outside 1..=3.
     InvalidCount { count: u32 },
     /// Scroll vector non-finite or past the per-operation tick cap.
-    InvalidScroll { dx: f64, dy: f64, detail: &'static str },
+    InvalidScroll { dx: f64, dy: f64, detail: String },
     /// A coordinate is NaN or infinite.
     NonFiniteCoordinate,
 }
@@ -260,25 +261,84 @@ pub fn drag_pointer(
         // The press reaches the peer before the steps even if the next
         // check fails, so a cancelled drag always has a press to release.
         flush_with_retry(scope.conn, "pointer", deadline, cancel)?;
-        for step in 1..=DRAG_STEPS {
-            check_wait("pointer", deadline, cancel)?;
-            let t = f64::from(step) / f64::from(DRAG_STEPS);
-            let step_point = OutputPoint {
-                x: (f64::from(from.x) + (f64::from(to.x) - f64::from(from.x)) * t).round()
-                    as u32,
-                y: (f64::from(from.y) + (f64::from(to.y) - f64::from(from.y)) * t).round()
-                    as u32,
-                x_extent: from.x_extent,
-                y_extent: from.y_extent,
+        let path = drag_path(from, to);
+        {
+            // Each step is flushed while the button is held, so the peer sees
+            // the interpolation instead of one burst at the release, and the
+            // pause is deadline/Stop bounded instead of a bare sleep.
+            let mut step = DragStep {
+                check: || check_wait("pointer", deadline, cancel).map_err(PointerError::from),
+                motion: |point: &OutputPoint| {
+                    scope.motion_abs(point);
+                    Ok(())
+                },
+                flush: || {
+                    flush_with_retry(scope.conn, "pointer", deadline, cancel)
+                        .map_err(PointerError::from)
+                },
+                pause: || {
+                    bounded_pause(deadline, cancel, DRAG_STEP_MS).map_err(PointerError::from)
+                },
             };
-            scope.motion_abs(&step_point);
-            std::thread::sleep(Duration::from_millis(DRAG_STEP_MS));
+            deliver_drag_steps(&path, &mut step)?;
         }
         check_wait("pointer", deadline, cancel)?;
         scope.motion_abs(&to);
         scope.release_held();
         Ok(())
     })
+}
+
+/// The interpolated points of a drag, one per [`DRAG_STEPS`], ending exactly
+/// at `to` (`t = step / DRAG_STEPS`, matching the reference bridge). Kept
+/// pure so the path can be pinned without a socket.
+pub(super) fn drag_path(from: OutputPoint, to: OutputPoint) -> Vec<OutputPoint> {
+    (1..=DRAG_STEPS)
+        .map(|step| {
+            let t = f64::from(step) / f64::from(DRAG_STEPS);
+            OutputPoint {
+                x: (f64::from(from.x) + (f64::from(to.x) - f64::from(from.x)) * t).round()
+                    as u32,
+                y: (f64::from(from.y) + (f64::from(to.y) - f64::from(from.y)) * t).round()
+                    as u32,
+                x_extent: from.x_extent,
+                y_extent: from.y_extent,
+            }
+        })
+        .collect()
+}
+
+/// The effects of one drag step, injected so the per-step cadence can be
+/// pinned deterministically: `check` gates the step, `motion` moves,
+/// `flush` pushes the queued requests to the peer, and `pause` waits between
+/// steps.
+pub(super) struct DragStep<C, M, F, P> {
+    pub check: C,
+    pub motion: M,
+    pub flush: F,
+    pub pause: P,
+}
+
+/// Drive `steps` through `step` in a fixed cadence: check, motion, flush,
+/// pause for every step. A failing effect ends the delivery immediately, so
+/// a mid-drag Stop or deadline aborts before the next step is queued.
+pub(super) fn deliver_drag_steps<C, M, F, P>(
+    steps: &[OutputPoint],
+    step: &mut DragStep<C, M, F, P>,
+) -> Result<(), PointerError>
+where
+    C: FnMut() -> Result<(), PointerError>,
+    M: FnMut(&OutputPoint) -> Result<(), PointerError>,
+    F: FnMut() -> Result<(), PointerError>,
+    P: FnMut() -> Result<(), PointerError>,
+{
+    for point in steps {
+        (step.check)()?;
+        (step.motion)(point)?;
+        (step.flush)()?;
+        (step.pause)()?;
+    }
+    Ok(())
 }
 
 /// Move to the global logical point (`x`, `y`) inside `monitor`, then emit
@@ -309,18 +369,25 @@ pub fn scroll_pointer(
         return Err(PointerError::InvalidScroll {
             dx,
             dy,
-            detail: "more than 40 axis ticks in one operation",
+            detail: format!(
+                "more than {MAX_SCROLL_TICKS} axis ticks in one operation; \
+split the scroll into several calls"
+            ),
         });
     }
     let resolved = resolve(snapshot, monitor)?;
     let point = to_output_point(monitor, x, y)?;
     run(conn, &resolved, deadline, cancel, |scope| {
         scope.motion_abs(&point);
+        // One deadline/Stop check per tick: a long scroll ends between ticks instead of
+        // queueing the whole vector as one uninterruptible burst (S6).
         for _ in 0..vertical as u32 {
+            check_wait("pointer", deadline, cancel)?;
             let value = if dy > 0.0 { SCROLL_STEP } else { -SCROLL_STEP };
             scope.axis(wl_pointer::Axis::VerticalScroll, value);
         }
         for _ in 0..horizontal as u32 {
+            check_wait("pointer", deadline, cancel)?;
             let value = if dx > 0.0 { SCROLL_STEP } else { -SCROLL_STEP };
             scope.axis(wl_pointer::Axis::HorizontalScroll, value);
         }
@@ -353,11 +420,12 @@ fn resolve(snapshot: &CapabilitySnapshot, monitor: &Monitor) -> Result<Resolved,
 
 /// A validated position in the selected output's logical space, with the
 /// extents the absolute-motion request maps it through.
-struct OutputPoint {
-    x: u32,
-    y: u32,
-    x_extent: u32,
-    y_extent: u32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OutputPoint {
+    pub x: u32,
+    pub y: u32,
+    pub x_extent: u32,
+    pub y_extent: u32,
 }
 
 /// Map a global logical point into the selected output's logical space.

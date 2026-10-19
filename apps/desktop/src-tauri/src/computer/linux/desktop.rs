@@ -22,9 +22,9 @@
 //! and post registers its [`CancelHandle`] on entry and the [`OperationGuard`]
 //! removes exactly its own entry on exit (success, error, or panic unwind),
 //! so two concurrent calls never clear each other and no entry leaks.
-//! [`OperationRegistry::cancel_all`] is the hook the future `Control::end`
-//! (Stop) wiring will call. It is not wired yet: nothing here claims Stop
-//! interrupts an in-flight operation until that wiring plus its test land.
+//! [`OperationRegistry::cancel_all`] is the hook `Control::end` (Stop) calls:
+//! the app wiring in `app.rs` installs it through `set_on_end`, so a Stop
+//! cancels every in-flight capture and post.
 //!
 //! Monitor selection: screenshots use the stock Niri focused output, asked
 //! through the existing Niri [`Client`](crate::niri::Client) request path
@@ -37,13 +37,25 @@
 //! Truthfulness: the Niri runtime gate reuses the centralized
 //! [`platform::is_niri`](crate::platform::is_niri) (no adapter-local
 //! predicate); off-Niri the adapter refuses before any socket I/O.
-//! `list_apps`/`open_app` fail explicitly as unsupported in this slice
-//! (never a faked empty list, never a spawned shell); Accessibility,
-//! frontmost, focused and window-owner queries report unknown under the
-//! explicit desktop-global policy (never fabricated identities); `activate`
+//! `list_apps`/`open_app` fan out to the injected [`Backend`]: the concrete
+//! Linux backend answers them from Niri's window inventory and GIO's
+//! trusted desktop-entry launcher (T5a, S7), while a backend that configures
+//! neither keeps the truthful unsupported refusal (never a faked empty list,
+//! never a spawned shell); Accessibility, frontmost, focused and
+//! window-owner queries report unknown under the explicit desktop-global
+//! policy (never fabricated identities); `activate`
 //! is a no-op until capabilities, UI and cancel are integrated later. Key
 //! and text map the existing [`KeyCombo`] through the native keyboard API
 //! without touching the Mac parser.
+//!
+//! Focus targeting (T4, S4/S5): [`Desktop::focused_window`] and
+//! [`Desktop::focus_window`] expose Niri's `FocusedWindow` query and
+//! `FocusWindow` action through [`super::focus`], reusing the existing
+//! bounded [`Client`](crate::niri::Client) path. The window id is the
+//! identity and the reply's pid only excludes Gentle Dot's own window;
+//! per-app blocking is still never claimed. The check and the post are
+//! separate IPC calls, so this seam does not pin a target against a focus
+//! that moves between them.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -59,7 +71,7 @@ use crate::computer::blocklist::AppIdentity;
 use crate::computer::coords::Point;
 use crate::computer::keys::KeyCombo;
 use crate::computer::risk::{AxElement, Focus};
-use crate::computer::{AppInfo, Capture, Desktop, MouseButton, Permissions};
+use crate::computer::{AppInfo, Capture, Desktop, FocusTarget, MouseButton, Permissions};
 
 /// Total budget for one [`Desktop`] call, shared by every phase inside it
 /// (discover, collect, capture/input, normalization). One deadline for the
@@ -218,6 +230,13 @@ pub trait Backend: Send + Sync {
     /// The Niri focused-output connector name (`None` when Niri reports no
     /// focused output).
     fn focused_output(&self) -> Result<Option<String>, String>;
+    /// The window Niri reports as focused (`None` when none is focused). The
+    /// window id is the target identity; the pid, when present, only excludes
+    /// our own window. A bounded single request, never an unbounded poll.
+    fn focused_window(&self) -> Result<Option<super::focus::FocusedWindow>, String>;
+    /// Focus the window with `id` again. The reply must report `Handled`; any
+    /// other reply is a truthful error, never a guessed success.
+    fn focus_window(&self, id: u64) -> Result<(), String>;
     /// Open one fresh exclusive Wayland connection. Called once per
     /// protocol phase; never retained, never cloned by the adapter.
     fn open(&self) -> Result<Connection, String>;
@@ -278,6 +297,28 @@ pub trait Backend: Send + Sync {
         deadline: Instant,
         cancel: &CancelHandle,
     ) -> Result<(), String>;
+    /// The running managed applications this backend can name
+    /// (`list_apps`, T5a/S7). The default is a truthful unsupported refusal,
+    /// so a backend that configures no inventory source returns no faked
+    /// empty list. `deadline` is the caller's total budget and `cancel` its
+    /// cooperative handle.
+    fn list_apps(&self, deadline: Instant, cancel: &CancelHandle) -> Result<Vec<AppInfo>, String> {
+        let _ = (deadline, cancel);
+        Err("list_apps is unsupported by this backend: no running-app inventory source \
+             is configured (refusing instead of returning a faked empty list)"
+            .to_owned())
+    }
+    /// Launch an installed desktop entry by exact id or unambiguous display
+    /// name (`open_app`, T5a/S7). The default is a truthful unsupported
+    /// refusal, so a backend that configures no launcher never spawns a
+    /// shell. A successful return is the launcher's acknowledgement only,
+    /// never proof that a window appeared or gained focus.
+    fn open_app(&self, name: &str, deadline: Instant, cancel: &CancelHandle) -> Result<(), String> {
+        let _ = (name, deadline, cancel);
+        Err("open_app is unsupported by this backend: no trusted launcher is configured \
+             (refusing instead of spawning a shell)"
+            .to_owned())
+    }
 }
 
 /// Registry of in-flight operation [`CancelHandle`]s, owned by the adapter.
@@ -318,10 +359,8 @@ impl OperationRegistry {
         OperationGuard { registry: self, id, handle }
     }
 
-    /// Cancel every in-flight operation. This is the hook the future
-    /// `Control::end` (Stop) wiring will call; it is not wired yet, so Stop
-    /// interrupting an operation is not claimed until that wiring and its
-    /// test land.
+    /// Cancel every in-flight operation. `Control::end` (Stop) reaches this
+    /// through the app wiring in `app.rs`.
     pub fn cancel_all(&self) {
         let active = self.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for (_, handle) in active.iter() {
@@ -357,8 +396,8 @@ impl<B> LinuxDesktop<B> {
         Self { backend, ops: OperationRegistry::default() }
     }
 
-    /// Cancel every in-flight capture/post. Future `Control::end` hook; not
-    /// wired to Stop yet (see [`OperationRegistry::cancel_all`]).
+    /// Cancel every in-flight capture/post. `Control::end` (Stop) reaches this
+    /// through the app wiring in `app.rs`.
     pub fn cancel_all(&self) {
         self.ops.cancel_all();
     }
@@ -519,17 +558,21 @@ impl<B: Backend> Desktop for LinuxDesktop<B> {
     }
 
     fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
-        Err("list_apps is unsupported on the Linux desktop in this slice: \
-             no Accessibility inventory exists to list (refusing instead of \
-             returning a faked empty list)"
-            .to_owned())
+        self.gate("list_apps")?;
+        let guard = self.ops.register();
+        let deadline = Instant::now() + OP_BUDGET;
+        self.backend
+            .list_apps(deadline, &guard.handle)
+            .map_err(|detail| format!("list_apps failed: {detail}"))
     }
 
     fn open_app(&self, name: &str) -> Result<(), String> {
-        let _ = name;
-        Err("open_app is unsupported on the Linux desktop in this slice: \
-             no trusted launcher exists yet (refusing instead of spawning a shell)"
-            .to_owned())
+        self.gate("open_app")?;
+        let guard = self.ops.register();
+        let deadline = Instant::now() + OP_BUDGET;
+        self.backend
+            .open_app(name, deadline, &guard.handle)
+            .map_err(|detail| format!("open_app failed: {detail}"))
     }
 
     fn element_at(&self, _at: Point) -> Vec<AxElement> {
@@ -556,6 +599,30 @@ impl<B: Backend> Desktop for LinuxDesktop<B> {
     fn activate(&self, _pid: i32) {
         // No Linux activation until capabilities, UI and cancel are
         // integrated later; deliberately a silent no-op (never a fake).
+    }
+
+    fn focused_window(&self) -> Result<Option<FocusTarget>, String> {
+        self.gate("focus")?;
+        let _guard = self.ops.register();
+        let window = self
+            .backend
+            .focused_window()
+            .map_err(|detail| format!("focus failed: {detail}"))?;
+        Ok(window.map(|window| FocusTarget {
+            window_id: window.id,
+            pid: window.pid,
+            title: window.title,
+            app_id: window.app_id,
+        }))
+    }
+
+    fn focus_window(&self, target: &FocusTarget) -> Result<(), String> {
+        self.gate("focus")?;
+        let _guard = self.ops.register();
+        // The exact window id, never a pid or first-window fallback.
+        self.backend
+            .focus_window(target.window_id)
+            .map_err(|detail| format!("focus restore failed: {detail}"))
     }
 }
 
